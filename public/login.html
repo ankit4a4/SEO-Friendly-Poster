@@ -1,0 +1,249 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Sign in — SEO Friendly Poster</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link
+    href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600;9..144,700;9..144,800&family=Inter:wght@400;500;600;700;800&display=swap"
+    rel="stylesheet">
+  <style>
+    :root {
+      --bg: #F4F7F7;
+      --surface: #FFF;
+      --ink: #131C1F;
+      --ink-soft: #2B3A3E;
+      --muted: #7C8C90;
+      --border: #E1E9EA;
+      --accent: #146C5E;
+      --accent-bright: #1E9C86;
+      --gold: #C9932E;
+      --danger: #C03B3B;
+      --danger-soft: #F6DEDE;
+      --shadow-lift: 0 10px 24px rgba(19, 28, 31, .10), 0 2px 6px rgba(19, 28, 31, .06);
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: var(--bg);
+      color: var(--ink);
+      font-family: 'Inter', system-ui, sans-serif;
+      line-height: 1.5;
+    }
+
+    .wrap {
+      width: 100%;
+      max-width: 380px;
+      padding: 24px;
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      justify-content: center;
+      margin-bottom: 22px;
+    }
+
+    .mark {
+      width: 32px;
+      height: 32px;
+      border-radius: 9px;
+      background: linear-gradient(135deg, var(--accent-bright), var(--accent));
+      color: #fff;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-family: 'Fraunces', serif;
+      font-weight: 700;
+      font-size: 16px;
+    }
+
+    .brand span.name {
+      font-family: 'Fraunces', serif;
+      font-weight: 700;
+      font-size: 18px;
+    }
+
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 30px 28px;
+      box-shadow: var(--shadow-lift);
+    }
+
+    h1 {
+      font-family: 'Fraunces', serif;
+      font-size: 22px;
+      font-weight: 700;
+      margin: 0 0 4px;
+      text-align: center;
+    }
+
+    .sub {
+      color: var(--muted);
+      font-size: 13px;
+      text-align: center;
+      margin: 0 0 24px;
+    }
+
+    label {
+      font-size: 12px;
+      font-weight: 700;
+      color: var(--ink-soft);
+      margin-bottom: 4px;
+      display: block;
+    }
+
+    .field {
+      margin-bottom: 14px;
+    }
+
+    input {
+      width: 100%;
+      font-size: 14px;
+      padding: 11px 12px;
+      border: 1px solid var(--border);
+      border-radius: 9px;
+      background: var(--bg);
+      color: var(--ink);
+    }
+
+    input:focus {
+      outline: 2px solid var(--accent);
+      outline-offset: 1px;
+    }
+
+    button {
+      width: 100%;
+      font-size: 14px;
+      font-weight: 700;
+      border-radius: 9px;
+      border: none;
+      padding: 12px 16px;
+      cursor: pointer;
+      color: #fff;
+      background: linear-gradient(135deg, var(--accent-bright), var(--accent));
+      box-shadow: 0 4px 14px rgba(20, 108, 94, .3);
+      transition: opacity .15s, transform .1s;
+      margin-top: 6px;
+    }
+
+    button:hover {
+      opacity: .9;
+    }
+
+    button:active {
+      transform: scale(.98);
+    }
+
+    button:disabled {
+      opacity: .6;
+      cursor: not-allowed;
+    }
+
+    .error {
+      display: none;
+      background: var(--danger-soft);
+      color: var(--danger);
+      font-size: 13px;
+      font-weight: 600;
+      padding: 10px 12px;
+      border-radius: 9px;
+      margin-bottom: 14px;
+    }
+
+    .error.show {
+      display: block;
+    }
+
+    .spin {
+      display: inline-block;
+      width: 13px;
+      height: 13px;
+      border: 2px solid rgba(255, 255, 255, .5);
+      border-top-color: #fff;
+      border-radius: 50%;
+      animation: spin .7s linear infinite;
+      margin-right: 7px;
+      vertical-align: -2px;
+    }
+
+    @keyframes spin {
+      to {
+        transform: rotate(360deg);
+      }
+    }
+  </style>
+</head>
+
+<body>
+  <div class="wrap">
+    <div class="brand"><span class="mark">S</span><span class="name">SEO Friendly Poster</span></div>
+    <div class="card">
+      <h1>Sign in</h1>
+      <p class="sub">Enter your admin credentials to continue.</p>
+      <div class="error" id="error"></div>
+      <form id="loginForm">
+        <div class="field">
+          <label>Username</label>
+          <input id="username" name="username" autocomplete="username" required autofocus />
+        </div>
+        <div class="field">
+          <label>Password</label>
+          <input id="password" name="password" type="password" autocomplete="current-password" required />
+        </div>
+        <button type="submit" id="submitBtn">Sign in</button>
+      </form>
+    </div>
+  </div>
+
+  <script>
+    const form = document.getElementById('loginForm');
+    const errorBox = document.getElementById('error');
+    const submitBtn = document.getElementById('submitBtn');
+
+    function showError(msg) {
+      errorBox.textContent = msg;
+      errorBox.classList.add('show');
+    }
+
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      errorBox.classList.remove('show');
+      submitBtn.disabled = true;
+      submitBtn.innerHTML = '<span class="spin"></span>Signing in…';
+
+      try {
+        const res = await fetch('/api/auth/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            username: document.getElementById('username').value.trim(),
+            password: document.getElementById('password').value,
+          }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.error || 'Login failed');
+        window.location.href = '/';
+      } catch (err) {
+        showError(err.message);
+        submitBtn.disabled = false;
+        submitBtn.textContent = 'Sign in';
+      }
+    });
+  </script>
+</body>
+
+</html>
