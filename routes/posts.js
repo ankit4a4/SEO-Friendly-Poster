@@ -59,7 +59,7 @@ router.post("/:id/generate", async (req, res) => {
     const post = await Post.findById(req.params.id);
     if (!post) return res.status(404).json({ error: "Post not found" });
 
-    const result = await rewrite(post.sourceTitle, post.sourceContent);
+    const result = await rewrite(post.sourceTitle, post.sourceContent, post.siteId);
     post.rewrittenTitle = result.title;
     post.rewrittenContent = result.content;
     post.focusKeyword = result.focusKeyword;

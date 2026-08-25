@@ -1,6 +1,7 @@
 const axios = require("axios");
 const cheerio = require("cheerio");
 const { scoreSeo, containsKeyword } = require("../lib/seoScorer");
+const Post = require("../models/Post");
 
 // Score an article must reach (post auto-fix) to be auto-published. Below this,
 // the post is saved as "seo_review_required" instead (see routes/posts.js, server.js).
@@ -11,11 +12,12 @@ const SEO_PASS_SCORE = Number(process.env.SEO_PASS_SCORE) || 80;
 // the source article - this is not a new dashboard feature, just a prompt/scoring
 // input, so it's stored on the post as a plain string (see models/Post.js: articleCategory).
 const CATEGORY_GUIDE = `
-- "News": 700-900 words
-- "Short News": 600-800 words (use only for a brief update/announcement with little to expand on)
-- "Business": 900-1200 words
-- "Startup": 900-1200 words (founder stories, funding, company building)
-- "Analysis": 1200-1500 words (deeper explainer/opinion pieces)`;
+- "News": 1200-1500 words
+- "Short News": 1200-1400 words (use only for a brief update/announcement with little to expand on - still needs real depth, not a stub)
+- "Business": 1200-1600 words
+- "Startup": 1200-1600 words (founder stories, funding, company building)
+- "Analysis": 1500-1800 words (deeper explainer/opinion pieces)
+Every category has a 1200-word FLOOR - never go below that, even for a "Short News" item, by adding genuinely useful context/background rather than filler.`;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -151,7 +153,7 @@ function buildPrompt(title, htmlContent) {
 
   // If the source content is too short (just a summary/headline), ask the AI to write a full article
   if (wordCount < 100) {
-    return `The source content below is too short (just a summary). Write a complete, well-structured, original blog post based on this title and summary - expand it naturally with relevant details, context, and explanation. A 600-word floor applies to every category, so treat that as an absolute minimum regardless of which category you pick.
+    return `The source content below is too short (just a summary). Write a complete, well-structured, original blog post based on this title and summary - expand it naturally with relevant details, context, and explanation. A 1200-word floor applies to every category, so treat that as an absolute minimum regardless of which category you pick.
 Use proper HTML tags (<p>, <h2>, <ul> etc), but do NOT include any hyperlinks, anchor tags, images, or URLs anywhere. ${noAttribution}
 ${WRITING_QUALITY_RULES}
 ${SOURCE_FIDELITY_RULES}
@@ -162,7 +164,7 @@ Title: ${title}
 Summary: ${htmlContent}`;
   }
 
-  return `Using the source article below as your factual base, write a fresh, more complete blog post on the same topic - not a sentence-by-sentence rewrite. Hit the word-count target for whichever category you choose, even if the source itself is shorter - expand with real context/background/explanation to get there naturally. A 600-word floor applies regardless of category.
+  return `Using the source article below as your factual base, write a fresh, more complete blog post on the same topic - not a sentence-by-sentence rewrite. Hit the word-count target for whichever category you choose, even if the source itself is shorter - expand with real context/background/explanation to get there naturally. A 1200-word floor applies regardless of category.
 Keep the HTML tags intact, but do NOT include any hyperlinks, anchor tags, images, or URLs anywhere in the output. ${noAttribution}
 ${WRITING_QUALITY_RULES}
 ${SOURCE_FIDELITY_RULES}
@@ -585,7 +587,83 @@ Source: ${truncateContent(sourceHtml)}
 Previous output: ${JSON.stringify({ title: result.title, content: result.content, category: result.category, focusKeyword: result.focusKeyword, seoTitle: result.seoTitle, metaDescription: result.metaDescription, slug: result.slug, excerpt: result.excerpt, tags: result.tags, imageAlt: result.imageAlt })}`;
 }
 
-async function rewrite(title, htmlContent) {
+// Real internal linking to the SAME site's own already-published posts - not the
+// source article's links (cleanContent() strips those, we don't have rights to
+// them). Uses the "keyFacts" people/organizations the model itself extracted
+// (see SOURCE_FIDELITY_RULES) to find other posted articles on this site that
+// cover the same person/company, and links the first mention of that name to
+// the existing post. Capped, and skipped entirely (never throws) if there's no
+// siteId, no named entities, no DB match, or the DB lookup itself fails - this
+// must never be the thing that breaks a generate.
+const MAX_INTERNAL_LINKS = 3;
+const MIN_ENTITY_NAME_LEN = 4; // skip trivial fragments like "AI" or "EV"
+
+async function findRelatedPosts(siteId) {
+  try {
+    return await Post.find({ siteId, status: "posted", publishedUrl: { $exists: true, $ne: null } })
+      .select("focusKeyword tags rewrittenTitle publishedUrl")
+      .lean();
+  } catch (err) {
+    console.warn(`⚠️  Internal-link lookup skipped (${err.message})`);
+    return [];
+  }
+}
+
+// Loose match, same idea as containsKeyword() in lib/seoScorer.js - does this
+// OTHER post's own title/keyword/tags mention the entity we're looking for?
+function matchEntityToPost(entity, posts, usedUrls) {
+  const e = entity.toLowerCase();
+  return posts.find((p) => {
+    if (!p.publishedUrl || usedUrls.has(p.publishedUrl)) return false;
+    const haystack = `${p.focusKeyword || ""} ${p.rewrittenTitle || ""} ${(p.tags || []).join(" ")}`.toLowerCase();
+    return haystack.includes(e);
+  });
+}
+
+async function attachInternalLinks(result, siteId) {
+  const entities = [...(result.keyFacts?.people || []), ...(result.keyFacts?.organizations || [])]
+    .filter((e) => e && e.length >= MIN_ENTITY_NAME_LEN);
+
+  if (!siteId || entities.length === 0) return { ...result, hasInternalLinkCandidates: false };
+
+  const candidates = await findRelatedPosts(siteId);
+  if (candidates.length === 0) return { ...result, hasInternalLinkCandidates: false };
+
+  const $ = cheerio.load(result.content || "", null, false);
+  const usedUrls = new Set();
+  let linksAdded = 0;
+
+  for (const entity of entities) {
+    if (linksAdded >= MAX_INTERNAL_LINKS) break;
+    const match = matchEntityToPost(entity, candidates, usedUrls);
+    if (!match) continue;
+
+    const re = new RegExp(entity.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
+    let linked = false;
+    $("p").each((_, el) => {
+      if (linked) return;
+      const $el = $(el);
+      if ($el.find("a").length > 0) return; // don't double-link inside an already-linked paragraph
+      const html = $el.html() || "";
+      if (re.test($el.text())) {
+        $el.html(html.replace(re, (m) => `<a href="${match.publishedUrl}">${m}</a>`));
+        linked = true;
+      }
+    });
+
+    if (linked) {
+      usedUrls.add(match.publishedUrl);
+      linksAdded++;
+    }
+  }
+
+  // hasInternalLinkCandidates: true because we DID find at least one other post
+  // to potentially link to - this is what lets lib/seoScorer.js fairly require
+  // an actual <a> tag now, rather than just recording that we tried.
+  return { ...result, content: $.html(), hasInternalLinkCandidates: true };
+}
+
+async function rewrite(title, htmlContent, siteId) {
   const truncated = truncateContent(htmlContent);
   const prompt = buildPrompt(title, truncated);
   const raw = await generateWithProviders(prompt);
@@ -603,6 +681,13 @@ async function rewrite(title, htmlContent) {
       console.error(`⚠️  Fact-preservation correction pass failed (${describeError(err)}) - keeping original result`);
     }
   }
+
+  // Link named people/companies to this site's other posts about them, then
+  // rescore once more so the "internalLinks" check (and the publish gate)
+  // reflect the linked version rather than the pre-link one.
+  result = await attachInternalLinks(result, siteId);
+  result.seo = scoreSeo({ ...result, category: result.category, hasInternalLinkCandidates: result.hasInternalLinkCandidates });
+  result.passed = result.seo.score >= SEO_PASS_SCORE;
 
   return result;
 }

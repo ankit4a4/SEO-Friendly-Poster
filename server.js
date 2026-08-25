@@ -278,7 +278,7 @@ async function processSite(site) {
       didWork = true;
 
       try {
-        const result = await rewrite(post.sourceTitle, post.sourceContent);
+        const result = await rewrite(post.sourceTitle, post.sourceContent, post.siteId);
         post.rewrittenTitle = result.title;
         post.rewrittenContent = result.content;
         post.focusKeyword = result.focusKeyword;
