@@ -470,21 +470,46 @@ async function tryGemini(prompt) {
 // mid-string (the "Unterminated string in JSON" error). reasoning_effort "low" cuts that
 // down, and max_completion_tokens is raised explicitly so a 700-900 word article + SEO
 // JSON always has room to finish.
+//
+// Supports multiple Groq API keys (comma-separated), same pooling as GEMINI_API_KEYS /
+// OPENROUTER_API_KEYS above - GROQ_API_KEYS=key1,key2,key3. Falls back to the single
+// GROQ_API_KEY var for backward compatibility if GROQ_API_KEYS isn't set.
+const GROQ_API_KEYS = (process.env.GROQ_API_KEYS || process.env.GROQ_API_KEY || "")
+  .split(",")
+  .map((k) => k.trim())
+  .filter(Boolean);
+
 async function tryGroq(prompt) {
-  if (!process.env.GROQ_API_KEY) return null;
-  const res = await axios.post(
-    "https://api.groq.com/openai/v1/chat/completions",
-    {
-      model: "openai/gpt-oss-120b",
-      messages: [{ role: "user", content: prompt }],
-      reasoning_effort: "low",
-      max_completion_tokens: 8000,
-    },
-    { headers: { Authorization: `Bearer ${process.env.GROQ_API_KEY}` }, timeout: PROVIDER_TIMEOUT_MS }
-  );
-  const text = res.data?.choices?.[0]?.message?.content;
-  if (!text) throw new Error("Groq returned no usable content");
-  return text;
+  if (GROQ_API_KEYS.length === 0) return null;
+
+  let lastErr;
+  for (let i = 0; i < GROQ_API_KEYS.length; i++) {
+    const key = GROQ_API_KEYS[i];
+    try {
+      const res = await axios.post(
+        "https://api.groq.com/openai/v1/chat/completions",
+        {
+          model: "openai/gpt-oss-120b",
+          messages: [{ role: "user", content: prompt }],
+          reasoning_effort: "low",
+          max_completion_tokens: 8000,
+        },
+        { headers: { Authorization: `Bearer ${key}` }, timeout: PROVIDER_TIMEOUT_MS }
+      );
+      const text = res.data?.choices?.[0]?.message?.content;
+      if (!text) throw new Error("Groq returned no usable content");
+      return text;
+    } catch (err) {
+      lastErr = err;
+      const keyLabel = `key #${i + 1}/${GROQ_API_KEYS.length} (…${key.slice(-4)})`;
+      if (i < GROQ_API_KEYS.length - 1) {
+        console.warn(`⚠️  Groq ${keyLabel} failed (${describeError(err)}) - trying next key`);
+      } else {
+        console.error(`❌ Groq ${keyLabel} failed (${describeError(err)}) - no more keys left`);
+      }
+    }
+  }
+  throw lastErr;
 }
 
 // 3) OpenRouter - fallback (free models, OpenAI-compatible)
