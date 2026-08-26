@@ -493,16 +493,44 @@ async function tryGroq(prompt) {
 // "unavailable for free" error). "openrouter/free" is OpenRouter's own auto-router - it
 // picks whichever free model is currently live, so this stops breaking every time the
 // lineup changes.
+//
+// Supports multiple OpenRouter API keys (comma-separated), same pooling idea as
+// GEMINI_API_KEYS above - OPENROUTER_API_KEYS=key1,key2,key3. Falls back to the
+// single OPENROUTER_API_KEY var for backward compatibility if OPENROUTER_API_KEYS
+// isn't set. OpenRouter's free tier is rate-limited PER KEY/ACCOUNT ("Rate limit
+// exceeded: free-models-per-day"), so one account hitting its daily cap doesn't
+// have to fail the whole provider - just move on to the next key.
+const OPENROUTER_API_KEYS = (process.env.OPENROUTER_API_KEYS || process.env.OPENROUTER_API_KEY || "")
+  .split(",")
+  .map((k) => k.trim())
+  .filter(Boolean);
+
 async function tryOpenRouter(prompt) {
-  if (!process.env.OPENROUTER_API_KEY) return null;
-  const res = await axios.post(
-    "https://openrouter.ai/api/v1/chat/completions",
-    { model: "openrouter/free", messages: [{ role: "user", content: prompt }] },
-    { headers: { Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}` }, timeout: PROVIDER_TIMEOUT_MS }
-  );
-  const text = res.data?.choices?.[0]?.message?.content;
-  if (!text) throw new Error("OpenRouter returned no usable content");
-  return text;
+  if (OPENROUTER_API_KEYS.length === 0) return null;
+
+  let lastErr;
+  for (let i = 0; i < OPENROUTER_API_KEYS.length; i++) {
+    const key = OPENROUTER_API_KEYS[i];
+    try {
+      const res = await axios.post(
+        "https://openrouter.ai/api/v1/chat/completions",
+        { model: "openrouter/free", messages: [{ role: "user", content: prompt }] },
+        { headers: { Authorization: `Bearer ${key}` }, timeout: PROVIDER_TIMEOUT_MS }
+      );
+      const text = res.data?.choices?.[0]?.message?.content;
+      if (!text) throw new Error("OpenRouter returned no usable content");
+      return text;
+    } catch (err) {
+      lastErr = err;
+      const keyLabel = `key #${i + 1}/${OPENROUTER_API_KEYS.length} (…${key.slice(-4)})`;
+      if (i < OPENROUTER_API_KEYS.length - 1) {
+        console.warn(`⚠️  OpenRouter ${keyLabel} failed (${describeError(err)}) - trying next key`);
+      } else {
+        console.error(`❌ OpenRouter ${keyLabel} failed (${describeError(err)}) - no more keys left`);
+      }
+    }
+  }
+  throw lastErr;
 }
 
 function describeError(err) {
