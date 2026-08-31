@@ -137,7 +137,7 @@ Work it in naturally each time - never as an awkward forced insertion - but ever
 
 const WRITING_QUALITY_RULES = `
 Writing quality (this is what actually helps the article rank, not just checklist boxes):
-- "title" MUST be kept EXACTLY as given in the "Title:" input below - do not rewrite it, reword it, or change it in any way, even slightly.
+- "title" MUST be a fresh, original headline - do NOT reuse the source's exact wording or copy it verbatim (this is a copyright requirement, not a style preference). Rephrase it in your own words while keeping the same meaning, the same key facts (people/companies/numbers), and roughly the same length/tone as a real news headline.
 - Genuinely rewrite, don't paraphrase sentence-by-sentence: understand the source, reorganize the information into your own structure, and use fully original wording. Add relevant context, background, or a "why this matters" angle the source didn't spell out.
 - Read like a professional business/news publication: no generic AI-sounding openers ("In today's fast-paced world...", "In this article, we will..."), no repetitive sentence patterns, no filler sentences that say nothing.
 - Never invent facts, statistics, quotes, sources, or company information that are not in the source content. If the source doesn't give a number/quote, don't make one up - describe it in general terms instead.
@@ -333,7 +333,7 @@ function parseResult(rawText, originalTitle) {
   const result = JSON.parse(extractJsonObject(cleaned));
   if (!result.title || !result.content) throw new Error("AI response missing title/content");
   result.content = cleanContent(result.content);
-  if (originalTitle) result.title = originalTitle;
+  result.title = (result.title || "").trim() || originalTitle;
 
   const category = (result.category || "").trim().toLowerCase();
   result.category = VALID_CATEGORIES.has(category) ? result.category.trim() : "News";
@@ -630,12 +630,12 @@ async function generateWithProviders(prompt) {
 function buildFactCorrectionPrompt(title, sourceHtml, result, missingFacts) {
   return `You previously rewrote the source article below into the JSON object shown as "Previous output". On review, the following facts from the source were dropped and need to be worked back in naturally: ${missingFacts.join(", ")}.
 
-Revise "content" so it includes these facts wherever they're relevant to the story, without inventing details beyond what the source states. Keep the rest of the article's wording, structure, and length target as close to the previous output as reasonably possible - this is a targeted fix, not a full rewrite. "title" must stay exactly as given below. Update "keyFacts" to reflect the revised article.
+Revise "content" so it includes these facts wherever they're relevant to the story, without inventing details beyond what the source states. Keep the rest of the article's wording, structure, and length target as close to the previous output as reasonably possible - this is a targeted fix, not a full rewrite. Keep "title" as it was in "Previous output" below (already a rewritten, original headline) - do not revert it to the source's original wording. Update "keyFacts" to reflect the revised article.
 ${SOURCE_FIDELITY_RULES}
 ${SEO_FIELD_RULES}
 Return ONLY a valid JSON object, no markdown fences: ${SEO_JSON_SHAPE}
 
-Title: ${title}
+Original source title (context only - your rewritten title is in "Previous output", not this): ${title}
 Source: ${truncateContent(sourceHtml)}
 Previous output: ${JSON.stringify({ title: result.title, content: result.content, category: result.category, focusKeyword: result.focusKeyword, seoTitle: result.seoTitle, metaDescription: result.metaDescription, slug: result.slug, excerpt: result.excerpt, tags: result.tags, imageAlt: result.imageAlt })}`;
 }

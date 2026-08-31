@@ -23,8 +23,10 @@ app.set("trust proxy", 1); // needed so req.ip / secure cookies work correctly b
 const CYCLE_GAP_MS = Number(process.env.CYCLE_GAP_MS) || 60 * 1000;
 // Pause after a failed publish before moving on to the next post (default: 2 minutes)
 const FAILURE_BACKOFF_MS = Number(process.env.FAILURE_BACKOFF_MS) || 2 * 60 * 1000;
-// Gap between two posts of the SAME site (generate -> publish -> wait -> next post), so the AI/WP APIs don't get hammered (default: 30 seconds)
-const SUCCESS_GAP_MS = Number(process.env.SUCCESS_GAP_MS) || 30 * 1000;
+// Gap between two posts of the SAME site (generate -> publish -> wait -> next post), so the AI/WP APIs don't get hammered (default: 20 seconds)
+const SUCCESS_GAP_MS = Number(process.env.SUCCESS_GAP_MS) || 20 * 1000;
+// Gap after a site FINISHES its whole batch before moving on to the next site in the same pass (default: 1 minute)
+const SITE_GAP_MS = Number(process.env.SITE_GAP_MS) || 60 * 1000;
 
 if (!process.env.SESSION_SECRET) {
   console.warn("⚠️  SESSION_SECRET is not set in .env - using a random one-off value (sessions won't survive a restart).");
@@ -246,9 +248,8 @@ async function processSite(site) {
   const maxToFetch = remainingToday === 0 ? 0 : remainingToday + 3;
   const sourcePosts = maxToFetch > 0 ? await fetchSourcePosts(site, doneIds, maxToFetch) : [];
 
-  // Did this site actually generate/publish anything this pass? Returned for
-  // logging/future use - there's no inter-site gap anymore, so runCycle moves
-  // on to the next site immediately regardless of this value.
+  // Did this site actually generate/publish anything this pass? Used by runCycle
+  // to decide whether to wait SITE_GAP_MS before moving on to the next site.
   let didWork = false;
 
   try {
@@ -388,16 +389,24 @@ async function runCycle() {
   isRunning = true;
   try {
     const sites = await Site.find({ active: true });
-    for (const site of sites) {
+    for (let i = 0; i < sites.length; i++) {
+      const site = sites[i];
       if (paused) break; // Stop was pressed mid-pass
       // Each site runs in its own try/catch - one broken/slow/unreachable source
-      // must not stop the other sites in this pass from being checked. As soon
-      // as this site's batch/limit is done we move straight to the next one -
-      // no artificial gap in between.
+      // must not stop the other sites in this pass from being checked.
+      let didWork = false;
       try {
-        await processSite(site);
+        didWork = await processSite(site);
       } catch (err) {
         console.error(`❌ Skipping "${site.name}" this pass:`, err.message);
+      }
+      // Once this site's batch/limit is done, wait a bit before starting the
+      // next site - only if this site actually did something and there IS a
+      // next site (no point waiting after the last one or after an idle site).
+      const isLastSite = i === sites.length - 1;
+      if (didWork && !isLastSite && !paused) {
+        console.log(`⏳ "${site.name}" done - waiting ${SITE_GAP_MS / 1000}s before next site`);
+        await sleep(SITE_GAP_MS);
       }
     }
   } catch (err) {
