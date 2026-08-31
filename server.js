@@ -10,6 +10,7 @@ const Site = require("./models/Site");
 const Post = require("./models/Post");
 const WorkerState = require("./models/WorkerState");
 const cron = require("node-cron");
+const { Limiter } = require("./lib/limiter");
 const { uploadImage, publishPost } = require("./services/wordpress");
 const { fetchSourcePosts, closeBrowser } = require("./services/scraper");
 const { rewrite } = require("./services/ai");
@@ -25,8 +26,13 @@ const CYCLE_GAP_MS = Number(process.env.CYCLE_GAP_MS) || 60 * 1000;
 const FAILURE_BACKOFF_MS = Number(process.env.FAILURE_BACKOFF_MS) || 2 * 60 * 1000;
 // Gap between two posts of the SAME site (generate -> publish -> wait -> next post), so the AI/WP APIs don't get hammered (default: 20 seconds)
 const SUCCESS_GAP_MS = Number(process.env.SUCCESS_GAP_MS) || 20 * 1000;
-// Gap after a site FINISHES its whole batch before moving on to the next site in the same pass (default: 1 minute)
-const SITE_GAP_MS = Number(process.env.SITE_GAP_MS) || 60 * 1000;
+// How many sites are processed AT THE SAME TIME (default: 6). Raising this is what
+// actually lets 70 sites finish their daily quotas quickly - a slow/stuck site (headless
+// browser fallback, a retrying provider) no longer blocks every other site behind it.
+// This does NOT bypass AI rate limits by itself - see AI_CONCURRENCY in services/ai.js,
+// which caps total concurrent AI calls across ALL of these sites combined.
+const CONCURRENT_SITES = Number(process.env.CONCURRENT_SITES) || 6;
+const siteLimiter = new Limiter(CONCURRENT_SITES);
 
 if (!process.env.SESSION_SECRET) {
   console.warn("⚠️  SESSION_SECRET is not set in .env - using a random one-off value (sessions won't survive a restart).");
@@ -74,10 +80,24 @@ let nextCycleAt = null;
 // pressed, or midnight (see the cron job below) resets it for the new day.
 let paused = false; // by default the worker runs; Stop pauses it, Start resumes it
 
-// Which site is actively being generated/published right now (null = none) -
-// lets the dashboard highlight that site in the sidebar in real time.
-let currentSiteId = null;
-let currentSiteName = null;
+// Which sites are actively being generated/published right now - lets the dashboard
+// highlight them in the sidebar in real time. Now a Map (siteId -> name) instead of a
+// single value, since CONCURRENT_SITES lets several sites be "active" at once.
+const activeSites = new Map();
+function markSiteActive(site) {
+  activeSites.set(site._id.toString(), site.name);
+}
+function markSiteInactive(site) {
+  activeSites.delete(site._id.toString());
+}
+// Backward-compatible single-value fields (last site to become active) so an
+// older dashboard build that only reads currentSiteId/currentSiteName still shows
+// something sensible; the new activeSites array in /api/status carries the full list.
+function currentSiteFields() {
+  const entries = [...activeSites.entries()];
+  const last = entries[entries.length - 1];
+  return { currentSiteId: last ? last[0] : null, currentSiteName: last ? last[1] : null };
+}
 
 async function setPaused(value, { startedBy } = {}) {
   paused = value;
@@ -92,8 +112,8 @@ app.get("/api/status", requireAuth, (req, res) => {
   res.json({
     nextRunAt: nextCycleAt ? nextCycleAt.toISOString() : null,
     paused,
-    currentSiteId,
-    currentSiteName,
+    ...currentSiteFields(),
+    activeSites: [...activeSites.entries()].map(([id, name]) => ({ id, name })),
   });
 });
 
@@ -273,10 +293,10 @@ async function processSite(site) {
       if (post.status !== "pending" || post.autoExcluded) continue;
 
       // Mark this site as "active" only once we actually start working on a post -
-      // this is what the dashboard highlights, and only ONE post (of ONE site) is
-      // ever generated/published at a time across the whole app.
-      currentSiteId = site._id.toString();
-      currentSiteName = site.name;
+      // this is what the dashboard highlights. Multiple sites can be active at once
+      // now (see CONCURRENT_SITES) - only ONE post per SITE is ever in flight, but
+      // different sites run concurrently.
+      markSiteActive(site);
       didWork = true;
 
       try {
@@ -371,10 +391,7 @@ async function processSite(site) {
     }
   } finally {
     // Site's turn is over (or it errored out) - clear the highlight either way.
-    if (currentSiteId === site._id.toString()) {
-      currentSiteId = null;
-      currentSiteName = null;
-    }
+    markSiteInactive(site);
   }
 
   return didWork;
@@ -398,26 +415,26 @@ async function runCycle() {
   isRunning = true;
   try {
     const sites = await Site.find({ active: true });
-    for (let i = 0; i < sites.length; i++) {
-      const site = sites[i];
-      if (paused) break; // Stop was pressed mid-pass
-      // Each site runs in its own try/catch - one broken/slow/unreachable source
-      // must not stop the other sites in this pass from being checked.
-      let didWork = false;
-      try {
-        didWork = await processSite(site);
-      } catch (err) {
-        console.error(`❌ Skipping "${site.name}" this pass:`, err.message);
-      }
-      // Once this site's batch/limit is done, wait a bit before starting the
-      // next site - only if this site actually did something and there IS a
-      // next site (no point waiting after the last one or after an idle site).
-      const isLastSite = i === sites.length - 1;
-      if (didWork && !isLastSite && !paused) {
-        console.log(`⏳ "${site.name}" done - waiting ${SITE_GAP_MS / 1000}s before next site`);
-        await sleep(SITE_GAP_MS);
-      }
-    }
+    // All sites are submitted to siteLimiter at once - it lets at most CONCURRENT_SITES
+    // of them actually run at a time and queues the rest, so this scales to 70+ sites
+    // without 70 sites' worth of sequential waiting. Each site still runs its own posts
+    // one at a time internally (processSite), and still funnels its AI calls through the
+    // separate, app-wide AI_CONCURRENCY limiter in services/ai.js - so turning this up
+    // speeds up scraping/imaging/publishing overlap, not AI request volume.
+    await Promise.all(
+      sites.map((site) =>
+        siteLimiter.run(async () => {
+          if (paused) return; // Stop was pressed - don't start sites that haven't begun yet
+          // Each site runs in its own try/catch - one broken/slow/unreachable source
+          // must not stop the other sites in this pass from being checked.
+          try {
+            await processSite(site);
+          } catch (err) {
+            console.error(`❌ Skipping "${site.name}" this pass:`, err.message);
+          }
+        })
+      )
+    );
   } catch (err) {
     console.error("Cycle error:", err.message);
   } finally {

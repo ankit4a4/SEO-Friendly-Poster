@@ -1,7 +1,21 @@
 const axios = require("axios");
 const cheerio = require("cheerio");
 const { scoreSeo, containsKeyword } = require("../lib/seoScorer");
+const { Limiter } = require("../lib/limiter");
 const Post = require("../models/Post");
+
+// Max AI generations in flight across the WHOLE app at any moment - regardless of
+// how many sites server.js is processing concurrently. This is the actual safety
+// net for free-tier keys: raising CONCURRENT_SITES in server.js makes scraping/
+// image-search/WordPress-upload happen in parallel across sites (real speed-up),
+// but every one of those sites still funnels its AI call through this ONE shared
+// limiter, so the free Gemini/Groq/OpenRouter keys never get hit harder than this
+// many requests at once, no matter how many sites (70, 700...) are configured.
+// Keep this modest (3-5) even with many pooled keys - each generation call can take
+// 10-25s, so 3-5 concurrent slots already means a healthy sustained rate; going
+// much higher risks bursting a free tier's per-minute cap even with pooled keys.
+const AI_CONCURRENCY = Number(process.env.AI_CONCURRENCY) || 3;
+const aiLimiter = new Limiter(AI_CONCURRENCY);
 
 // Score an article must reach (post auto-fix) to be auto-published. Below this,
 // the post is saved as "seo_review_required" instead (see routes/posts.js, server.js).
@@ -731,23 +745,29 @@ const PROVIDERS = [tryGemini, tryGroq, tryOpenRouter];
 // Both the normal generation call and the one-shot fact-correction pass share this,
 // so neither adds a new provider or a new fallback architecture.
 async function generateWithProviders(prompt) {
-  let lastError;
-  for (let round = 1; round <= FULL_ROUNDS; round++) {
-    for (const provider of PROVIDERS) {
-      try {
-        const raw = await callWithRetry(provider, prompt);
-        if (raw) return raw;
-      } catch (err) {
-        console.error(`❌ AI provider "${provider.name}" failed (round ${round}/${FULL_ROUNDS}): ${describeError(err)}`);
-        lastError = new Error(`${provider.name}: ${describeError(err)}`);
+  // Gate the ENTIRE fallback chain (Gemini -> Groq -> OpenRouter, all retries/rounds)
+  // behind the shared limiter - one slot per in-flight article generation, held for
+  // as long as this call takes. This is what keeps many concurrent sites (server.js)
+  // from turning into many concurrent AI bursts.
+  return aiLimiter.run(async () => {
+    let lastError;
+    for (let round = 1; round <= FULL_ROUNDS; round++) {
+      for (const provider of PROVIDERS) {
+        try {
+          const raw = await callWithRetry(provider, prompt);
+          if (raw) return raw;
+        } catch (err) {
+          console.error(`❌ AI provider "${provider.name}" failed (round ${round}/${FULL_ROUNDS}): ${describeError(err)}`);
+          lastError = new Error(`${provider.name}: ${describeError(err)}`);
+        }
+      }
+      if (round < FULL_ROUNDS) {
+        console.warn(`⚠️  All AI providers failed this round - waiting ${ROUND_DELAY_MS / 1000}s before trying the full chain again...`);
+        await sleep(ROUND_DELAY_MS);
       }
     }
-    if (round < FULL_ROUNDS) {
-      console.warn(`⚠️  All AI providers failed this round - waiting ${ROUND_DELAY_MS / 1000}s before trying the full chain again...`);
-      await sleep(ROUND_DELAY_MS);
-    }
-  }
-  throw lastError || new Error("All AI providers failed");
+    throw lastError || new Error("All AI providers failed");
+  });
 }
 
 // Builds the single, targeted correction prompt used when the entity-preservation
