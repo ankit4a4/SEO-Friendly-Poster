@@ -420,7 +420,23 @@ const VALID_CATEGORIES = new Set(["news", "short news", "business", "startup", "
 
 function parseResult(rawText, originalTitle) {
   const cleaned = rawText.replace(/```json|```/g, "").trim();
-  const result = parseJsonLeniently(extractJsonObject(cleaned));
+  let objectText;
+  try {
+    objectText = extractJsonObject(cleaned);
+  } catch (err) {
+    // "No JSON object found" (no "{" anywhere) usually means the model replied with
+    // something other than JSON entirely - a refusal, an apology, a safety-filter
+    // message, plain prose explaining what it did instead of doing it. The error
+    // alone doesn't say WHICH of those happened, so log a preview of what it actually
+    // sent - makes this diagnosable instead of a black box. (A TruncatedJsonError DID
+    // find and start a JSON object, just didn't finish it, so there's nothing extra
+    // to show there.)
+    if (!(err instanceof TruncatedJsonError)) {
+      console.error(`⚠️  AI response had no JSON object - first 300 chars: ${cleaned.slice(0, 300)}`);
+    }
+    throw err;
+  }
+  const result = parseJsonLeniently(objectText);
   if (!result.title || !result.content) throw new Error("AI response missing title/content");
   result.content = cleanContent(result.content);
   result.title = (result.title || "").trim() || originalTitle;
@@ -766,7 +782,14 @@ async function generateAndParse(prompt, originalTitle, { retries = 1 } = {}) {
       return parseResult(raw, originalTitle);
     } catch (err) {
       lastErr = err;
-      const willRetry = attempt < retries;
+      // Only a genuinely TRUNCATED response is worth asking again for - that's a
+      // one-off "ran out of output budget" hiccup, nothing to do with the content.
+      // Any other parse failure (no JSON at all, missing title/content, etc.) usually
+      // means the model didn't follow the JSON instruction for THIS specific content -
+      // retrying with the exact same prompt rarely changes that, so fail fast instead
+      // of silently doubling the wait for no benefit.
+      const isTruncation = err instanceof TruncatedJsonError;
+      const willRetry = isTruncation && attempt < retries;
       console.warn(
         `⚠️  Could not parse AI JSON response (${err.message})${willRetry ? " - regenerating" : " - giving up"}`
       );
