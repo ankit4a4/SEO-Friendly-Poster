@@ -302,6 +302,12 @@ function containsKeywordLoose(haystack, keyword) {
 // on the trimmed string then fails with "Unexpected non-whitespace character after JSON".
 // Extract just the outermost {...} object (by brace-matching, so nested braces in the
 // article HTML don't confuse it) before parsing.
+//
+// Tagged with its own error class so callers can tell "the response got cut off
+// mid-object" (worth retrying the generation - see generateAndParse below) apart from
+// "the object came back malformed but complete" (worth trying a repair pass on instead).
+class TruncatedJsonError extends Error {}
+
 function extractJsonObject(text) {
   const start = text.indexOf("{");
   if (start === -1) throw new Error("No JSON object found in AI response");
@@ -323,14 +329,98 @@ function extractJsonObject(text) {
       if (depth === 0) return text.slice(start, i + 1);
     }
   }
-  throw new Error("Unterminated JSON object in AI response");
+  // Ran out of text before every "{" was closed - the model's output was cut off
+  // (almost always the provider's own output-token limit on a long article), not a
+  // formatting slip. No amount of syntax repair can recover content that was never
+  // generated, so this is deliberately a distinct error from a plain parse failure.
+  throw new TruncatedJsonError("AI response was cut off before the JSON object finished (looks truncated)");
+}
+
+// Walks the text the same way extractJsonObject does (tracking whether we're inside a
+// JSON string) and escapes any RAW control byte - an actual newline/tab/carriage-return
+// character, not the two-character "\n" escape sequence - found inside a string value.
+// Models sometimes put a literal line break into "content" instead of writing "\\n",
+// which is illegal inside a JSON string and is exactly what causes
+// "Bad control character in string literal". Never touches the JSON structure itself,
+// only bytes that are already inside an open string.
+function escapeRawControlCharsInStrings(text) {
+  let out = "";
+  let inString = false;
+  let escaped = false;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    const code = text.charCodeAt(i);
+    if (inString) {
+      if (escaped) {
+        out += ch;
+        escaped = false;
+        continue;
+      }
+      if (ch === "\\") {
+        out += ch;
+        escaped = true;
+        continue;
+      }
+      if (ch === '"') {
+        inString = false;
+        out += ch;
+        continue;
+      }
+      if (code < 0x20) {
+        if (ch === "\n") out += "\\n";
+        else if (ch === "\r") out += "\\r";
+        else if (ch === "\t") out += "\\t";
+        else out += "\\u" + code.toString(16).padStart(4, "0");
+        continue;
+      }
+      out += ch;
+      continue;
+    }
+    if (ch === '"') inString = true;
+    out += ch;
+  }
+  return out;
+}
+
+// Last-resort fixes for the handful of ways a model occasionally produces near-JSON
+// instead of strict JSON: smart/curly quotes standing in for straight ones, and a
+// trailing comma before a closing "}"/"]" (a common cause of "Expected double-quoted
+// property name" - the parser expects another property after the comma and doesn't
+// find one). Only ever used as a fallback AFTER a plain parse has already failed, so
+// it can't introduce a bug on the common case where the response was already valid.
+function repairJsonSyntax(text) {
+  return text
+    .replace(/[\u201C\u201D]/g, '"')
+    .replace(/[\u2018\u2019]/g, "'")
+    .replace(/,(\s*[}\]])/g, "$1");
+}
+
+// Tries, in order: plain parse -> control-char-escaped parse -> control-char +
+// quote/trailing-comma repair. Returns the parsed object from whichever attempt
+// succeeds first. If none succeed, re-throws the FIRST (plain-parse) error, since
+// that one best describes what the model actually sent.
+function parseJsonLeniently(objectText) {
+  const attempts = [
+    objectText,
+    escapeRawControlCharsInStrings(objectText),
+    repairJsonSyntax(escapeRawControlCharsInStrings(objectText)),
+  ];
+  let firstError;
+  for (const attempt of attempts) {
+    try {
+      return JSON.parse(attempt);
+    } catch (err) {
+      if (!firstError) firstError = err;
+    }
+  }
+  throw firstError;
 }
 
 const VALID_CATEGORIES = new Set(["news", "short news", "business", "startup", "analysis"]);
 
 function parseResult(rawText, originalTitle) {
   const cleaned = rawText.replace(/```json|```/g, "").trim();
-  const result = JSON.parse(extractJsonObject(cleaned));
+  const result = parseJsonLeniently(extractJsonObject(cleaned));
   if (!result.title || !result.content) throw new Error("AI response missing title/content");
   result.content = cleanContent(result.content);
   result.title = (result.title || "").trim() || originalTitle;
@@ -382,10 +472,19 @@ function findMissingFacts(result) {
   const missing = [];
   for (const category of KEY_FACT_CATEGORIES) {
     for (const fact of facts[category] || []) {
-      if (!containsKeyword(haystack, fact)) missing.push(fact);
+      if (!containsKeyword(haystack, fact)) missing.push({ category, fact });
     }
   }
-  return missing;
+  // The correction pass is a full second AI call (roughly doubles this post's
+  // generation time), so only fire it for drops that actually change the story - a
+  // missing person/organization/product is worth fixing every time. A single missing
+  // number or date is usually a minor stat mentioned in passing; only worth a
+  // correction pass once several have piled up.
+  const highValue = missing.filter(
+    (m) => m.category === "people" || m.category === "organizations" || m.category === "products"
+  );
+  if (highValue.length === 0 && missing.length < 3) return [];
+  return missing.map((m) => m.fact);
 }
 
 // Runs the full generate -> score -> (one auto-fix if needed) -> final score
@@ -442,8 +541,10 @@ async function tryGemini(prompt) {
           // maxOutputTokens set explicitly (same idea as Groq's max_completion_tokens below) -
           // without this, Gemini's own default ceiling was cutting off longer articles +
           // SEO JSON mid-response, causing "Unterminated JSON object" / "No JSON object found".
-          // 8000 tokens comfortably covers a 1800-word article plus all the JSON metadata fields.
-          generationConfig: { thinkingConfig: { thinkingLevel: "low" }, maxOutputTokens: 8000 },
+          // Raised from 8000 to 12000 - the "Analysis" category (1500-1800 words) plus HTML
+          // tags, escaped JSON, and the full keyFacts/SEO metadata block was tight enough at
+          // 8000 to genuinely run out mid-response on longer articles (see TruncatedJsonError).
+          generationConfig: { thinkingConfig: { thinkingLevel: "low" }, maxOutputTokens: 12000 },
         },
         { timeout: PROVIDER_TIMEOUT_MS }
       );
@@ -496,7 +597,9 @@ async function tryGroq(prompt) {
           model: "openai/gpt-oss-120b",
           messages: [{ role: "user", content: prompt }],
           reasoning_effort: "low",
-          max_completion_tokens: 8000,
+          // Raised from 8000 to 12000 - same truncation-avoidance reasoning as Gemini's
+          // maxOutputTokens above.
+          max_completion_tokens: 12000,
         },
         { headers: { Authorization: `Bearer ${key}` }, timeout: PROVIDER_TIMEOUT_MS }
       );
@@ -546,7 +649,8 @@ async function tryOpenRouter(prompt) {
         // max_tokens set explicitly (same idea as Groq's max_completion_tokens above) - the
         // "openrouter/free" auto-router's own default ceiling was cutting off longer articles
         // + SEO JSON mid-response, causing "Unterminated JSON object" / "No JSON object found".
-        { model: "openrouter/free", messages: [{ role: "user", content: prompt }], max_tokens: 8000 },
+        // Raised from 8000 to 12000 - same truncation-avoidance reasoning as Gemini/Groq above.
+        { model: "openrouter/free", messages: [{ role: "user", content: prompt }], max_tokens: 12000 },
         { headers: { Authorization: `Bearer ${key}` }, timeout: PROVIDER_TIMEOUT_MS }
       );
       const text = res.data?.choices?.[0]?.message?.content;
@@ -647,6 +751,31 @@ Source: ${truncateContent(sourceHtml)}
 Previous output: ${JSON.stringify({ title: result.title, content: result.content, category: result.category, focusKeyword: result.focusKeyword, seoTitle: result.seoTitle, metaDescription: result.metaDescription, slug: result.slug, excerpt: result.excerpt, tags: result.tags, imageAlt: result.imageAlt })}`;
 }
 
+// Wraps generateWithProviders + parseResult: a genuinely TRUNCATED response (see
+// TruncatedJsonError above) can't be fixed by any amount of JSON repair - the content
+// just wasn't finished - so the only real fix is asking again. Malformed-but-complete
+// JSON is already handled by parseJsonLeniently before it ever gets here, so this only
+// re-fires the AI call in the truncation case (or if parseResult's own validation, e.g.
+// missing title/content, fails). Bounded to one retry so a persistently-truncating
+// provider can't loop forever.
+async function generateAndParse(prompt, originalTitle, { retries = 1 } = {}) {
+  let lastErr;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    const raw = await generateWithProviders(prompt);
+    try {
+      return parseResult(raw, originalTitle);
+    } catch (err) {
+      lastErr = err;
+      const willRetry = attempt < retries;
+      console.warn(
+        `⚠️  Could not parse AI JSON response (${err.message})${willRetry ? " - regenerating" : " - giving up"}`
+      );
+      if (!willRetry) throw lastErr;
+    }
+  }
+  throw lastErr;
+}
+
 // Real internal linking to the SAME site's own already-published posts - not the
 // source article's links (cleanContent() strips those, we don't have rights to
 // them). Uses the "keyFacts" people/organizations the model itself extracted
@@ -726,8 +855,7 @@ async function attachInternalLinks(result, siteId) {
 async function rewrite(title, htmlContent, siteId) {
   const truncated = truncateContent(htmlContent);
   const prompt = buildPrompt(title, truncated);
-  const raw = await generateWithProviders(prompt);
-  let result = finalizeArticle(parseResult(raw, title));
+  let result = finalizeArticle(await generateAndParse(prompt, title));
 
   // Entity-preservation check (max ONE extra AI call, per the fidelity requirement) -
   // only fires when the model's own extracted facts didn't make it into the article.
@@ -735,8 +863,7 @@ async function rewrite(title, htmlContent, siteId) {
   if (missing.length > 0) {
     try {
       const correctionPrompt = buildFactCorrectionPrompt(title, truncated, result, missing);
-      const correctedRaw = await generateWithProviders(correctionPrompt);
-      result = finalizeArticle(parseResult(correctedRaw, title));
+      result = finalizeArticle(await generateAndParse(correctionPrompt, title));
     } catch (err) {
       console.error(`⚠️  Fact-preservation correction pass failed (${describeError(err)}) - keeping original result`);
     }
