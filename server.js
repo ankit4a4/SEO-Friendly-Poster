@@ -248,8 +248,9 @@ async function processSite(site) {
   const maxToFetch = remainingToday === 0 ? 0 : remainingToday + 3;
   const sourcePosts = maxToFetch > 0 ? await fetchSourcePosts(site, doneIds, maxToFetch) : [];
 
-  // Did this site actually generate/publish anything this pass? Used by runCycle
-  // to decide whether to wait SITE_GAP_MS before moving on to the next site.
+  // Did this site actually generate/publish anything this pass? Returned for
+  // logging/future use - there's no inter-site gap anymore, so runCycle moves
+  // on to the next site immediately regardless of this value.
   let didWork = false;
 
   try {
@@ -322,7 +323,15 @@ async function processSite(site) {
         // (Forbes/TechCrunch/etc) and republishing it directly is a copyright risk - that's
         // exactly why the stock-photo APIs were added. findAnyImage() always returns something
         // (it has its own guaranteed fallback), so imageUrl is never null here.
-        const imageUrl = (await findPersonPhoto(post.sourceTitle)) || (await findAnyImage(post.sourceTitle, site.imageKeyword));
+        // findPersonPhoto is capped at 20s total (Clearbit + team-page scrape + Wikidata) -
+        // this was the main reason auto-posting was much slower per post than manually
+        // clicking Generate/Publish (routes/posts.js only calls findAnyImage, never this).
+        // If it doesn't resolve in time we just move on to findAnyImage's faster chain.
+        const personPhoto = await Promise.race([
+          findPersonPhoto(post.sourceTitle),
+          sleep(20000).then(() => null),
+        ]);
+        const imageUrl = personPhoto || (await findAnyImage(post.sourceTitle, site.imageKeyword));
         let mediaId = null;
         try {
           mediaId = await uploadImage(site, imageUrl, result.imageAlt, post.slug);

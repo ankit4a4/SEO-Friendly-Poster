@@ -79,10 +79,15 @@ const TEAM_PAGE_PATHS = ["/about", "/about-us", "/team", "/leadership", "/compan
 
 async function findTeamPageImage(domain, personName) {
   if (!domain || !personName) return null;
-  for (const path of TEAM_PAGE_PATHS) {
-    try {
+  // Try all paths IN PARALLEL instead of one-by-one - sequentially trying 7 paths
+  // at up to 8s each could take nearly a minute when several don't exist/are slow
+  // (very common), which was the main reason auto-posting was so much slower than
+  // manually clicking Generate (routes/posts.js skips findPersonPhoto entirely).
+  // Results are checked back in TEAM_PAGE_PATHS order so priority is preserved.
+  const attempts = await Promise.allSettled(
+    TEAM_PAGE_PATHS.map(async (path) => {
       const url = `https://${domain}${path}`;
-      const res = await axios.get(url, { timeout: 8000, headers: { "User-Agent": "Mozilla/5.0" } });
+      const res = await axios.get(url, { timeout: 6000, headers: { "User-Agent": "Mozilla/5.0" } });
       const $ = cheerio.load(res.data);
       let found = null;
       $("*").each((_, el) => {
@@ -93,8 +98,11 @@ async function findTeamPageImage(domain, personName) {
           if (img) found = img.startsWith("http") ? img : new URL(img, url).href;
         }
       });
-      if (found) return found;
-    } catch { /* this path doesn't exist / site blocked us - try the next one */ }
+      return found;
+    })
+  );
+  for (const attempt of attempts) {
+    if (attempt.status === "fulfilled" && attempt.value) return attempt.value;
   }
   return null;
 }
