@@ -439,7 +439,11 @@ async function tryGemini(prompt) {
           // to a Gemini 3.x model is what was causing the
           // "400 Request contains an invalid argument" on every key - the request itself
           // was malformed, not a key/quota problem.
-          generationConfig: { thinkingConfig: { thinkingLevel: "low" } },
+          // maxOutputTokens set explicitly (same idea as Groq's max_completion_tokens below) -
+          // without this, Gemini's own default ceiling was cutting off longer articles +
+          // SEO JSON mid-response, causing "Unterminated JSON object" / "No JSON object found".
+          // 8000 tokens comfortably covers a 1800-word article plus all the JSON metadata fields.
+          generationConfig: { thinkingConfig: { thinkingLevel: "low" }, maxOutputTokens: 8000 },
         },
         { timeout: PROVIDER_TIMEOUT_MS }
       );
@@ -539,7 +543,10 @@ async function tryOpenRouter(prompt) {
     try {
       const res = await axios.post(
         "https://openrouter.ai/api/v1/chat/completions",
-        { model: "openrouter/free", messages: [{ role: "user", content: prompt }] },
+        // max_tokens set explicitly (same idea as Groq's max_completion_tokens above) - the
+        // "openrouter/free" auto-router's own default ceiling was cutting off longer articles
+        // + SEO JSON mid-response, causing "Unterminated JSON object" / "No JSON object found".
+        { model: "openrouter/free", messages: [{ role: "user", content: prompt }], max_tokens: 8000 },
         { headers: { Authorization: `Bearer ${key}` }, timeout: PROVIDER_TIMEOUT_MS }
       );
       const text = res.data?.choices?.[0]?.message?.content;
